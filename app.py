@@ -20,7 +20,7 @@ MODEL_NAME = "gemini-3.8-flash"
 FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
 # موديلات تحويل الصوت إلى نص (بالترتيب)
-TRANSCRIBE_MODELS = ["gemini-3.5-flash-lite", MODEL_NAME, "gemini-3.1-flash-lite"]
+TRANSCRIBE_MODELS = [MODEL_NAME, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
 st.set_page_config(page_title="المساعد الهندسي الذكي للمواصفات", layout="wide")
 
@@ -171,17 +171,23 @@ def send_with_retry(client, query):
 
 
 def transcribe_audio(client, audio_bytes, mime_type="audio/wav"):
-    """بيحوّل التسجيل الصوتي إلى نص (عربي مع مصطلحات إنجليزي)."""
+    """بيحوّل التسجيل الصوتي إلى نص عربي مكتوب بالحروف العربية."""
     prompt = (
-        "فرّغ هذا التسجيل الصوتي إلى نص حرفياً كما قيل بالضبط، بدون أي إضافات أو شرح. "
-        "الكلام غالباً بالعربية (لهجة مصرية) مع مصطلحات هندسية إنجليزية، "
-        "اكتب المصطلحات الإنجليزية بحروف إنجليزية. اكتب النص فقط."
+        "هذا تسجيل صوتي لمهندس كهرباء مصري يسأل سؤالاً بالعربية (اللهجة المصرية). "
+        "فرّغ الكلام إلى نص مكتوب بالحروف العربية كما قيل بالضبط. "
+        "لا تترجم ولا تفسّر ولا تغيّر الكلمات ولا تضف شيئاً. "
+        "اكتب الكلمات العربية بحروف عربية حتى لو بدت لك قريبة من كلمات إنجليزية. "
+        "لا تكتب كلمة بالإنجليزية إلا إذا نطقها المتحدث فعلاً بالإنجليزية بوضوح "
+        "كاختصار أو مصطلح هندسي (مثل MCCB أو XLPE). "
+        "إذا لم يكن هناك كلام واضح اكتب فقط: [غير واضح]. "
+        "اكتب نص الكلام فقط."
     )
     contents = [types.Part.from_bytes(data=audio_bytes, mime_type=mime_type), prompt]
+    config = types.GenerateContentConfig(temperature=0.0)
     last_error = None
     for model in TRANSCRIBE_MODELS:
         try:
-            result = client.models.generate_content(model=model, contents=contents)
+            result = client.models.generate_content(model=model, contents=contents, config=config)
             return (result.text or "").strip()
         except Exception as e:
             if not is_temporary_error(e):
@@ -250,8 +256,12 @@ if uploaded_files and api_key:
     # الإدخال الصوتي (ميكروفون)
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎤 اسأل بالصوت")
-    audio = st.sidebar.audio_input("اضغط على الميكروفون، اتكلم، وبعدين اضغط إيقاف")
-    voice_query = None
+    if "audio_n" not in st.session_state:
+        st.session_state.audio_n = 0
+    audio = st.sidebar.audio_input(
+        "اضغط على الميكروفون، اتكلم، وبعدين اضغط إيقاف",
+        key=f"audio_{st.session_state.audio_n}",
+    )
     if audio is not None:
         audio_bytes = audio.getvalue()
         audio_id = hashlib.md5(audio_bytes).hexdigest()
@@ -260,14 +270,34 @@ if uploaded_files and api_key:
             st.session_state.last_audio_id = audio_id
             try:
                 with st.spinner("جاري تحويل صوتك إلى نص..."):
-                    voice_query = transcribe_audio(client, audio_bytes, audio.type or "audio/wav")
-                if not voice_query:
+                    heard = transcribe_audio(client, audio_bytes, audio.type or "audio/wav")
+                if heard and "غير واضح" not in heard:
+                    st.session_state.pending_voice = heard
+                    st.session_state.pending_voice_box = heard
+                else:
                     st.sidebar.warning("ماسمعتش كلام واضح في التسجيل، جرّب تاني.")
             except Exception as e:
                 if is_temporary_error(e):
                     st.sidebar.error("خوادم جوجل عليها ضغط دلوقتي. استنى دقيقة وسجّل تاني.")
                 else:
                     st.sidebar.error(f"حدث خطأ أثناء تحويل الصوت: {e}")
+
+    # مراجعة النص المفرّغ قبل الإرسال (عشان تصحح أي كلمة اتفهمت غلط)
+    voice_query = None
+    if st.session_state.get("pending_voice"):
+        st.sidebar.caption("✏️ ده اللي فهمته من صوتك. عدّله لو فيه غلط، وبعدين اضغط إرسال:")
+        edited = st.sidebar.text_area(
+            "نص سؤالك", key="pending_voice_box", label_visibility="collapsed"
+        )
+        col_send, col_cancel = st.sidebar.columns(2)
+        if col_send.button("إرسال ✅", use_container_width=True):
+            voice_query = edited.strip() or None
+            st.session_state.pending_voice = None
+            st.session_state.audio_n += 1  # بيصفّر الميكروفون للتسجيل الجاي
+        if col_cancel.button("إلغاء ❌", use_container_width=True):
+            st.session_state.pending_voice = None
+            st.session_state.audio_n += 1
+            st.rerun()
 
     # واجهة المحادثة
     text_query = st.chat_input("اكتب استفسارك الفني أو اطلب جدول مقارنة للمواصفات...")
@@ -286,6 +316,8 @@ if uploaded_files and api_key:
                 if st.session_state.get("fallback_used"):
                     st.caption("ℹ️ الموديل الأساسي كان عليه ضغط، فالإجابة دي من موديل أخف. راجع الأرقام المهمة بنفسك.")
                 st.session_state.messages.append({"role": "assistant", "text": answer})
+                if voice_query:
+                    st.rerun()
             except Exception as e:
                 # مانخزنش الخطأ كإجابة، ونشيل السؤال عشان تقدر تسأله تاني
                 st.session_state.messages.pop()
