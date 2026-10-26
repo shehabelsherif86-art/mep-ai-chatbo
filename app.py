@@ -4,6 +4,7 @@ from google.genai import types
 import tempfile
 import os
 import time
+import hashlib
 from io import BytesIO
 from docx import Document
 from docx.oxml import OxmlElement
@@ -14,8 +15,12 @@ from docx.oxml import OxmlElement
 # اسم الموديل (لو جوجل قفلته مستقبلاً غيّره من هنا فقط)
 MODEL_NAME = "gemini-3.8-flash"
 
-# موديل احتياطي لو الأساسي عليه ضغط (خطأ 503)
-FALLBACK_MODEL = "gemini-flash-latest"
+# موديلات احتياطية لو الأساسي عليه ضغط (خطأ 503). كلها موديلات مختلفة عن الأساسي
+# عشان لو واحد عليه ضغط يجرب اللي بعده (Flash-Lite أخف وسعته غالباً أكبر)
+FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+
+# موديلات تحويل الصوت إلى نص (بالترتيب)
+TRANSCRIBE_MODELS = ["gemini-3.5-flash-lite", MODEL_NAME, "gemini-3.1-flash-lite"]
 
 st.set_page_config(page_title="المساعد الهندسي الذكي للمواصفات", layout="wide")
 
@@ -135,24 +140,54 @@ def is_temporary_error(error):
 
 def send_with_retry(client, query):
     """بيعيد المحاولة كذا مرة لو الموديل عليه ضغط، وبعدها بيجرب موديل احتياطي."""
-    for attempt in range(4):
+    st.session_state.fallback_used = None
+    for attempt in range(3):
         try:
             return st.session_state.chat.send_message(query).text
         except Exception as e:
             if not is_temporary_error(e):
                 raise
-            time.sleep(2 ** (attempt + 1))  # 2 ثم 4 ثم 8 ثم 16 ثانية
+            time.sleep(2 ** (attempt + 1))  # 2 ثم 4 ثم 8 ثواني
 
-    # كل المحاولات فشلت: جرّب الموديل الاحتياطي بنفس سجل المحادثة
+    # كل المحاولات فشلت: جرّب الموديلات الاحتياطية بنفس سجل المحادثة
+    config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
     history = st.session_state.chat.get_history()
-    fallback_chat = client.chats.create(
-        model=FALLBACK_MODEL,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-        history=history,
+    last_error = None
+    for model in FALLBACK_MODELS:
+        try:
+            fallback_chat = client.chats.create(model=model, config=config, history=history)
+            answer = fallback_chat.send_message(query).text
+            # نرجع للموديل الأساسي في الأسئلة الجاية مع الاحتفاظ بسجل المحادثة
+            st.session_state.chat = client.chats.create(
+                model=MODEL_NAME, config=config, history=fallback_chat.get_history()
+            )
+            st.session_state.fallback_used = model
+            return answer
+        except Exception as e:
+            if not is_temporary_error(e):
+                raise
+            last_error = e
+    raise last_error
+
+
+def transcribe_audio(client, audio_bytes, mime_type="audio/wav"):
+    """بيحوّل التسجيل الصوتي إلى نص (عربي مع مصطلحات إنجليزي)."""
+    prompt = (
+        "فرّغ هذا التسجيل الصوتي إلى نص حرفياً كما قيل بالضبط، بدون أي إضافات أو شرح. "
+        "الكلام غالباً بالعربية (لهجة مصرية) مع مصطلحات هندسية إنجليزية، "
+        "اكتب المصطلحات الإنجليزية بحروف إنجليزية. اكتب النص فقط."
     )
-    answer = fallback_chat.send_message(query).text
-    st.session_state.chat = fallback_chat
-    return answer
+    contents = [types.Part.from_bytes(data=audio_bytes, mime_type=mime_type), prompt]
+    last_error = None
+    for model in TRANSCRIBE_MODELS:
+        try:
+            result = client.models.generate_content(model=model, contents=contents)
+            return (result.text or "").strip()
+        except Exception as e:
+            if not is_temporary_error(e):
+                raise
+            last_error = e
+    raise last_error
 
 
 def build_word_file(text):
@@ -212,8 +247,31 @@ if uploaded_files and api_key:
         with st.chat_message(msg["role"]):
             st.markdown(clean_text(msg["text"]))
 
+    # الإدخال الصوتي (ميكروفون)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎤 اسأل بالصوت")
+    audio = st.sidebar.audio_input("اضغط على الميكروفون، اتكلم، وبعدين اضغط إيقاف")
+    voice_query = None
+    if audio is not None:
+        audio_bytes = audio.getvalue()
+        audio_id = hashlib.md5(audio_bytes).hexdigest()
+        # نعالج كل تسجيل مرة واحدة بس (ستريمليت بيعيد تشغيل الصفحة مع كل تفاعل)
+        if st.session_state.get("last_audio_id") != audio_id:
+            st.session_state.last_audio_id = audio_id
+            try:
+                with st.spinner("جاري تحويل صوتك إلى نص..."):
+                    voice_query = transcribe_audio(client, audio_bytes, audio.type or "audio/wav")
+                if not voice_query:
+                    st.sidebar.warning("ماسمعتش كلام واضح في التسجيل، جرّب تاني.")
+            except Exception as e:
+                if is_temporary_error(e):
+                    st.sidebar.error("خوادم جوجل عليها ضغط دلوقتي. استنى دقيقة وسجّل تاني.")
+                else:
+                    st.sidebar.error(f"حدث خطأ أثناء تحويل الصوت: {e}")
+
     # واجهة المحادثة
-    user_query = st.chat_input("اكتب استفسارك الفني أو اطلب جدول مقارنة للمواصفات...")
+    text_query = st.chat_input("اكتب استفسارك الفني أو اطلب جدول مقارنة للمواصفات...")
+    user_query = text_query or voice_query
     if user_query:
         st.session_state.messages.append({"role": "user", "text": user_query})
         with st.chat_message("user"):
@@ -225,6 +283,8 @@ if uploaded_files and api_key:
                     answer = send_with_retry(client, user_query)
                 answer = answer or "لم أتمكن من توليد إجابة، جرّب إعادة صياغة السؤال."
                 st.markdown(clean_text(answer))
+                if st.session_state.get("fallback_used"):
+                    st.caption("ℹ️ الموديل الأساسي كان عليه ضغط، فالإجابة دي من موديل أخف. راجع الأرقام المهمة بنفسك.")
                 st.session_state.messages.append({"role": "assistant", "text": answer})
             except Exception as e:
                 # مانخزنش الخطأ كإجابة، ونشيل السؤال عشان تقدر تسأله تاني
