@@ -5,8 +5,10 @@ import tempfile
 import os
 import time
 from io import BytesIO
+from datetime import date
 from docx import Document
 from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 # ---------------------------------------------------------
 # الإعدادات العامة
@@ -211,19 +213,114 @@ def transcribe_audio(client, audio_bytes, mime_type="audio/wav"):
     raise last_error
 
 
-def build_word_file(text):
-    """بيعمل ملف Word من آخر إجابة، والفقرات من اليمين لليسار."""
-    doc = Document()
-    doc.add_heading("تقرير استشاري هندسي - مواصفات الكهرباء", 0)
-    for line in text.split("\n"):
-        line = line.strip()
+def _rtl_paragraph(paragraph):
+    """الفقرة من اليمين لليسار."""
+    paragraph._p.get_or_add_pPr().append(OxmlElement("w:bidi"))
+    return paragraph
+
+
+def _add_formatted_text(paragraph, text):
+    """بيضيف النص للفقرة، وبيحوّل **النص** إلى خط عريض."""
+    parts = text.replace("`", "").split("**")
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        bold = i % 2 == 1
+        run = paragraph.add_run(part)
+        run.bold = bold
+        run.font.cs_bold = bold
+        run.font.rtl = True
+
+
+def _is_table_line(line):
+    return line.startswith("|") and line.count("|") >= 2
+
+
+def _is_separator_row(cells):
+    return all(c.strip() and set(c.strip()) <= set("-: ") for c in cells)
+
+
+def _add_table(doc, rows):
+    cols = max(len(r) for r in rows)
+    table = doc.add_table(rows=len(rows), cols=cols)
+    table.style = "Table Grid"
+    # الجدول من اليمين لليسار (العنصر لازم ييجي قبل tblW عشان ترتيب XML يبقى صح)
+    tbl_pr = table._tbl.tblPr
+    bidi = OxmlElement("w:bidiVisual")
+    tbl_w = tbl_pr.find(qn("w:tblW"))
+    if tbl_w is not None:
+        tbl_w.addprevious(bidi)
+    else:
+        tbl_pr.append(bidi)
+    for r_idx, row in enumerate(rows):
+        for c_idx in range(cols):
+            text = row[c_idx] if c_idx < len(row) else ""
+            para = _rtl_paragraph(table.cell(r_idx, c_idx).paragraphs[0])
+            _add_formatted_text(para, ("**" + text + "**") if r_idx == 0 and text else text)
+    doc.add_paragraph()
+
+
+def _add_markdown(doc, text):
+    """بيحوّل رد الموديل (Markdown) إلى عناوين وقوائم وجداول في Word."""
+    lines = (text or "").split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
         if not line:
+            i += 1
+            continue
+        if _is_table_line(line):
+            rows = []
+            while i < len(lines) and _is_table_line(lines[i].strip()):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                if not _is_separator_row(cells):
+                    rows.append(cells)
+                i += 1
+            if rows:
+                _add_table(doc, rows)
             continue
         if line.startswith("#"):
-            para = doc.add_heading(line.lstrip("#").strip().replace("**", ""), level=2)
+            para = doc.add_heading(line.lstrip("#").strip().replace("**", ""), level=3)
+            _rtl_paragraph(para)
+            for run in para.runs:
+                run.font.rtl = True
+        elif line.startswith(("- ", "* ", "• ")):
+            para = _rtl_paragraph(doc.add_paragraph(style="List Bullet"))
+            _add_formatted_text(para, line[2:].strip())
         else:
-            para = doc.add_paragraph(line.replace("**", ""))
-        para._p.get_or_add_pPr().append(OxmlElement("w:bidi"))
+            para = _rtl_paragraph(doc.add_paragraph())
+            _add_formatted_text(para, line)
+        i += 1
+
+
+def build_word_file(messages, file_names=None):
+    """بيعمل ملف Word فيه المحادثة كلها (كل الأسئلة وكل الإجابات) بالترتيب."""
+    doc = Document()
+    title = _rtl_paragraph(doc.add_heading("سجل المحادثة الاستشارية - مواصفات الكهرباء", 0))
+    for run in title.runs:
+        run.font.rtl = True
+
+    info = _rtl_paragraph(doc.add_paragraph())
+    _add_formatted_text(info, "تاريخ التصدير: " + date.today().isoformat())
+    if file_names:
+        docs_line = _rtl_paragraph(doc.add_paragraph())
+        _add_formatted_text(docs_line, "المستندات المرجعية: " + "، ".join(file_names))
+
+    q_no = 0
+    for msg in messages:
+        if msg["role"] == "user":
+            q_no += 1
+            heading = _rtl_paragraph(doc.add_heading("السؤال " + str(q_no), level=1))
+            for run in heading.runs:
+                run.font.rtl = True
+            para = _rtl_paragraph(doc.add_paragraph())
+            _add_formatted_text(para, msg["text"])
+        else:
+            heading = _rtl_paragraph(doc.add_heading("الإجابة", level=2))
+            for run in heading.runs:
+                run.font.rtl = True
+            _add_markdown(doc, msg["text"])
+
     buffer = BytesIO()
     doc.save(buffer)
     buffer.seek(0)
@@ -355,15 +452,16 @@ if uploaded_files and api_key:
                 else:
                     st.error(f"حدث خطأ أثناء المعالجة: {e}")
 
-    # زر تصدير آخر استشارة إلى Word
+    # زر تصدير المحادثة كاملة إلى Word
     st.sidebar.markdown("---")
     st.sidebar.subheader("📄 تصدير المخرجات")
-    assistant_msgs = [m for m in st.session_state.messages if m["role"] == "assistant"]
-    if assistant_msgs:
+    if st.session_state.messages:
+        questions_count = sum(1 for m in st.session_state.messages if m["role"] == "user")
+        st.sidebar.caption("عدد الأسئلة في المحادثة: " + str(questions_count))
         st.sidebar.download_button(
-            label="📥 تحميل آخر استشارة كملف Word",
-            data=build_word_file(assistant_msgs[-1]["text"]),
-            file_name="MEP_Technical_Report.docx",
+            label="📥 تحميل المحادثة كاملة (Word)",
+            data=build_word_file(st.session_state.messages, [f.name for f in uploaded_files]),
+            file_name="MEP_Chat_History.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
     else:
