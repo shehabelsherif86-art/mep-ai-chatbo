@@ -14,6 +14,9 @@ from docx.oxml import OxmlElement
 # اسم الموديل (لو جوجل قفلته مستقبلاً غيّره من هنا فقط)
 MODEL_NAME = "gemini-3.8-flash"
 
+# موديل احتياطي لو الأساسي عليه ضغط (خطأ 503)
+FALLBACK_MODEL = "gemini-flash-latest"
+
 st.set_page_config(page_title="المساعد الهندسي الذكي للمواصفات", layout="wide")
 
 # ضبط اتجاه النص (عربي + إنجليزي) وشكل الجداول
@@ -122,6 +125,36 @@ def start_chat(client, file_refs):
     )
 
 
+def is_temporary_error(error):
+    """أخطاء مؤقتة من جوجل (ضغط على الموديل أو حد الاستخدام)."""
+    msg = str(error)
+    return any(k in msg for k in (
+        "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "overloaded"
+    ))
+
+
+def send_with_retry(client, query):
+    """بيعيد المحاولة كذا مرة لو الموديل عليه ضغط، وبعدها بيجرب موديل احتياطي."""
+    for attempt in range(4):
+        try:
+            return st.session_state.chat.send_message(query).text
+        except Exception as e:
+            if not is_temporary_error(e):
+                raise
+            time.sleep(2 ** (attempt + 1))  # 2 ثم 4 ثم 8 ثم 16 ثانية
+
+    # كل المحاولات فشلت: جرّب الموديل الاحتياطي بنفس سجل المحادثة
+    history = st.session_state.chat.get_history()
+    fallback_chat = client.chats.create(
+        model=FALLBACK_MODEL,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        history=history,
+    )
+    answer = fallback_chat.send_message(query).text
+    st.session_state.chat = fallback_chat
+    return answer
+
+
 def build_word_file(text):
     """بيعمل ملف Word من آخر إجابة، والفقرات من اليمين لليسار."""
     doc = Document()
@@ -188,13 +221,18 @@ if uploaded_files and api_key:
 
         with st.chat_message("assistant"):
             try:
-                with st.spinner("جاري التحليل..."):
-                    response = st.session_state.chat.send_message(user_query)
-                answer = response.text or "لم أتمكن من توليد إجابة، جرّب إعادة صياغة السؤال."
+                with st.spinner("جاري التحليل... (لو الموديل عليه ضغط هعيد المحاولة تلقائياً)"):
+                    answer = send_with_retry(client, user_query)
+                answer = answer or "لم أتمكن من توليد إجابة، جرّب إعادة صياغة السؤال."
+                st.markdown(clean_text(answer))
+                st.session_state.messages.append({"role": "assistant", "text": answer})
             except Exception as e:
-                answer = f"حدث خطأ أثناء المعالجة: {e}"
-            st.markdown(clean_text(answer))
-        st.session_state.messages.append({"role": "assistant", "text": answer})
+                # مانخزنش الخطأ كإجابة، ونشيل السؤال عشان تقدر تسأله تاني
+                st.session_state.messages.pop()
+                if is_temporary_error(e):
+                    st.error("خوادم جوجل عليها ضغط عالي دلوقتي. استنى دقيقة واسأل السؤال تاني.")
+                else:
+                    st.error(f"حدث خطأ أثناء المعالجة: {e}")
 
     # زر تصدير آخر استشارة إلى Word
     st.sidebar.markdown("---")
