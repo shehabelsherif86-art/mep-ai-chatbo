@@ -4,7 +4,6 @@ from google.genai import types
 import tempfile
 import os
 import time
-import hashlib
 from io import BytesIO
 from docx import Document
 from docx.oxml import OxmlElement
@@ -263,22 +262,32 @@ if uploaded_files and api_key:
         key=f"audio_{st.session_state.audio_n}",
     )
     if audio is not None:
-        audio_bytes = audio.getvalue()
-        audio_id = hashlib.md5(audio_bytes).hexdigest()
-        # نعالج كل تسجيل مرة واحدة بس (ستريمليت بيعيد تشغيل الصفحة مع كل تفاعل)
-        if st.session_state.get("last_audio_id") != audio_id:
-            st.session_state.last_audio_id = audio_id
+        st.sidebar.caption(
+            "🎧 اسمع تسجيلك. لو مش واضح اضغط مسح وسجّل تاني، ولو تمام اضغط تحويل لنص."
+        )
+        col_go, col_del = st.sidebar.columns(2)
+        convert_clicked = col_go.button("تحويل لنص ✍️", use_container_width=True)
+        delete_clicked = col_del.button("مسح 🗑️", use_container_width=True)
+
+        if delete_clicked:
+            # بيمسح التسجيل ويصفّر الميكروفون عشان تسجل من جديد
+            st.session_state.pending_voice = None
+            st.session_state.audio_n += 1
+            st.rerun()
+
+        # مفيش تفريغ تلقائي: التفريغ بيبدأ بس لما تضغط الزر
+        if convert_clicked:
             try:
                 with st.spinner("جاري تحويل صوتك إلى نص..."):
-                    heard = transcribe_audio(client, audio_bytes, audio.type or "audio/wav")
+                    heard = transcribe_audio(client, audio.getvalue(), audio.type or "audio/wav")
                 if heard and "غير واضح" not in heard:
                     st.session_state.pending_voice = heard
                     st.session_state.pending_voice_box = heard
                 else:
-                    st.sidebar.warning("ماسمعتش كلام واضح في التسجيل، جرّب تاني.")
+                    st.sidebar.warning("ماسمعتش كلام واضح في التسجيل، امسحه وسجّل تاني.")
             except Exception as e:
                 if is_temporary_error(e):
-                    st.sidebar.error("خوادم جوجل عليها ضغط دلوقتي. استنى دقيقة وسجّل تاني.")
+                    st.sidebar.error("خوادم جوجل عليها ضغط دلوقتي. استنى دقيقة وجرّب تاني.")
                 else:
                     st.sidebar.error(f"حدث خطأ أثناء تحويل الصوت: {e}")
 
