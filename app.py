@@ -78,7 +78,7 @@ def get_client(key):
     لو اتعمل client جديد مع كل إعادة تشغيل للصفحة، النسخة القديمة بتتقفل تلقائياً
     والمحادثة المحفوظة بتفضل تستخدمها، وده بيطلّع خطأ: Cannot send a request, as the client has been closed.
     """
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=120_000))
 
 
 def clean_text(text):
@@ -140,11 +140,14 @@ def start_chat(client, file_refs):
 
 
 def is_temporary_error(error):
-    """أخطاء مؤقتة من جوجل (ضغط على الموديل أو حد الاستخدام)."""
-    msg = str(error)
-    return any(k in msg for k in (
-        "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "overloaded"
-    ))
+    """أخطاء مؤقتة من جوجل (ضغط على الموديل أو حد الاستخدام أو تأخر الرد)."""
+    msg = str(error).lower()
+    kind = type(error).__name__.lower()
+    keywords = (
+        "503", "unavailable", "429", "resource_exhausted", "500", "internal",
+        "overloaded", "504", "deadline", "timed out", "timeout",
+    )
+    return any(k in msg for k in keywords) or "timeout" in kind
 
 
 def send_with_retry(client, query):
@@ -192,7 +195,10 @@ def transcribe_audio(client, audio_bytes, mime_type="audio/wav"):
         "اكتب نص الكلام فقط."
     )
     contents = [types.Part.from_bytes(data=audio_bytes, mime_type=mime_type), prompt]
-    config = types.GenerateContentConfig(temperature=0.0)
+    config = types.GenerateContentConfig(
+        temperature=0.0,
+        http_options=types.HttpOptions(timeout=45_000),
+    )
     last_error = None
     for model in TRANSCRIBE_MODELS:
         try:
@@ -287,9 +293,13 @@ if uploaded_files and api_key:
 
         # مفيش تفريغ تلقائي: التفريغ بيبدأ بس لما تضغط الزر
         if convert_clicked:
+            audio_bytes = audio.getvalue()
             try:
-                with st.spinner("جاري تحويل صوتك إلى نص..."):
-                    heard = transcribe_audio(client, audio.getvalue(), audio.type or "audio/wav")
+                if len(audio_bytes) < 4000:
+                    heard = None  # تسجيل فاضي أو بايظ، مفيش داعي نبعته لجوجل
+                else:
+                    with st.spinner("جاري تحويل صوتك إلى نص... (بحد أقصى دقيقة)"):
+                        heard = transcribe_audio(client, audio_bytes, audio.type or "audio/wav")
                 if heard and "غير واضح" not in heard:
                     st.session_state.pending_voice = heard
                     st.session_state.pending_voice_box = heard
