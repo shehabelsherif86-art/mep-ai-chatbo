@@ -1,3 +1,3 @@
-   streamlit
-   google-genai
-   python-docx
+streamlit>=1.40
+google-genai
+python-docx
