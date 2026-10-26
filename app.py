@@ -71,6 +71,16 @@ SYSTEM_PROMPT = """
 # ---------------------------------------------------------
 # دوال مساعدة
 # ---------------------------------------------------------
+@st.cache_resource
+def get_client(key):
+    """
+    بنحتفظ بنفس الـ client طول فترة تشغيل التطبيق.
+    لو اتعمل client جديد مع كل إعادة تشغيل للصفحة، النسخة القديمة بتتقفل تلقائياً
+    والمحادثة المحفوظة بتفضل تستخدمها، وده بيطلّع خطأ: Cannot send a request, as the client has been closed.
+    """
+    return genai.Client(api_key=key)
+
+
 def clean_text(text):
     """علامة $ بتخلي ستريمليت يعرض الأرقام كمعادلات، والـ backticks بتبوّظ ترتيب العربي."""
     return (text or "").replace("$", "\\$").replace("`", "")
@@ -231,7 +241,7 @@ if "messages" not in st.session_state:
 
 if uploaded_files and api_key:
     api_key = api_key.strip()
-    client = genai.Client(api_key=api_key)
+    client = get_client(api_key)
 
     # لو الملفات أو المفتاح اتغيروا، نرفع الملفات ونبدأ محادثة جديدة
     signature = (tuple((f.name, f.size) for f in uploaded_files), api_key)
