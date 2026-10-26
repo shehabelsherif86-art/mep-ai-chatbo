@@ -16,14 +16,16 @@ from docx.oxml.ns import qn
 # اسم الموديل (لو جوجل قفلته مستقبلاً غيّره من هنا فقط)
 MODEL_NAME = "gemini-3.8-flash"
 
-# موديلات احتياطية لو الأساسي عليه ضغط (خطأ 503). كلها موديلات مختلفة عن الأساسي
-# عشان لو واحد عليه ضغط يجرب اللي بعده (Flash-Lite أخف وسعته غالباً أكبر)
+# موديلات احتياطية لو الأساسي عليه ضغط (خطأ 503)
 FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
 # موديلات تحويل الصوت إلى نص (بالترتيب)
 TRANSCRIBE_MODELS = [MODEL_NAME, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
-st.set_page_config(page_title="المساعد الهندسي الذكي للمواصفات", layout="wide")
+PAGE_REVIEW = "📑 مراجعة العروض الفنية"
+PAGE_CHAT = "💬 الشات الهندسي"
+
+st.set_page_config(page_title="منصة مراجعة العروض الفنية ومواصفات الكهرباء", layout="wide")
 
 # ضبط اتجاه النص (عربي + إنجليزي) وشكل الجداول
 st.markdown("""
@@ -56,11 +58,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-SYSTEM_PROMPT = """
-أنت استشاري هندسي كهربائي خبير. أجب على أسئلة المهندس بالاعتماد حصرياً على المستندات المرفقة.
-يجب أن تكون إجاباتك هندسية دقيقة، ومنظمة في شكل نقاط (Bullet Points)، واستخدم جداول المقارنة عند استعراض الفروق الفنية أو البنود.
-اذكر رقم البند أو الصفحة إن أمكن.
-
+FORMAT_RULES = """
 قواعد التنسيق (مهمة جداً):
 - اكتب بالعربية، والمصطلحات الإنجليزية بين قوسين بعد المصطلح العربي، مثال: كابلات أحادية النواة (Single Core).
 - لا تستخدم علامة الدولار ($) ولا صيغ LaTeX نهائياً.
@@ -69,9 +67,35 @@ SYSTEM_PROMPT = """
 - اكتب المقاسات والوحدات كنص عادي، مثال: 4 × 240 مم²، واستخدم جدولاً أو نقاطاً قصيرة بدل جملة عربية طويلة فيها أرقام متتالية.
 """
 
+CHAT_SYSTEM_PROMPT = """
+أنت استشاري هندسي كهربائي خبير. أجب على أسئلة المهندس بالاعتماد حصرياً على المستندات المرفقة.
+المستندات نوعان: مواصفات المشروع، وعروض فنية مقدمة من الموردين (إن وُجدت).
+عند الحديث عن عرض مورد اذكر اسم ملفه، وعند المقارنة بين عرض والمواصفات حدد الفروق بدقة.
+يجب أن تكون إجاباتك هندسية دقيقة، ومنظمة في شكل نقاط (Bullet Points)، واستخدم جداول المقارنة عند استعراض الفروق الفنية أو البنود.
+اذكر رقم البند أو الصفحة إن أمكن.
+""" + FORMAT_RULES
+
+
+def build_review_prompt(spec_names, sub_name):
+    return (
+        "أنت استشاري هندسي كهربائي محترف وخبير في مراجعة العروض الفنية (Technical Submittals) "
+        "ومطابقة المواصفات القياسية لمشاريع البنية التحتية والمنشآت.\n"
+        "المستندات المرفقة: مواصفات المشروع (" + "، ".join(spec_names) + ") "
+        "ثم العرض الفني المقدم من المورد (" + sub_name + ").\n"
+        "قارن العرض الفني بمواصفات المشروع بدقة هندسية تامة، واعتمد على المستندات المرفقة فقط.\n\n"
+        "قم بإعداد تقرير هندسي احترافي باللغة العربية يتضمن العناصر التالية:\n"
+        "1. **ملخص تنفيذي:** نظرة عامة عن البند محل المقارنة (كابلات، لوحات، محولات، قواطع، إنارة، إلخ).\n"
+        "2. **جدول المطابقة الفنية (Technical Compliance Table):** جدول يوضح (المواصفات المطلوبة، "
+        "المواصفات المقدمة من المورد، حالة المطابقة: مطابق / غير مطابق / مطابقة بشروط).\n"
+        "3. **الانحرافات والاختلافات الجوهرية (Deviations & Discrepancies):** رصد أي قصور أو فروق فنية "
+        "عن المواصفات الاستشارية.\n"
+        "4. **التوصية النهائية والقرار الهندسي:** (قبول، قبول مع ملاحظات، أو رفض مع إبداء الأسباب الهندسية).\n"
+        + FORMAT_RULES
+    )
+
 
 # ---------------------------------------------------------
-# دوال مساعدة
+# دوال مساعدة عامة
 # ---------------------------------------------------------
 @st.cache_resource
 def get_client(key):
@@ -80,65 +104,12 @@ def get_client(key):
     لو اتعمل client جديد مع كل إعادة تشغيل للصفحة، النسخة القديمة بتتقفل تلقائياً
     والمحادثة المحفوظة بتفضل تستخدمها، وده بيطلّع خطأ: Cannot send a request, as the client has been closed.
     """
-    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=120_000))
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=240_000))
 
 
 def clean_text(text):
     """علامة $ بتخلي ستريمليت يعرض الأرقام كمعادلات، والـ backticks بتبوّظ ترتيب العربي."""
     return (text or "").replace("$", "\\$").replace("`", "")
-
-
-def wait_for_file(client, uploaded):
-    """استنى لحد ما الملف المرفوع يبقى جاهز عند جوجل."""
-    while uploaded.state.name == "PROCESSING":
-        time.sleep(2)
-        uploaded = client.files.get(name=uploaded.name)
-    if uploaded.state.name == "FAILED":
-        raise RuntimeError("فشلت معالجة أحد الملفات عند جوجل. جرّب ملف PDF تاني.")
-    return uploaded
-
-
-def upload_files_to_gemini(client, files):
-    refs = []
-    for file in files:
-        path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-                f.write(file.getvalue())
-                path = f.name
-            uploaded = client.files.upload(file=path)
-            refs.append(wait_for_file(client, uploaded))
-        finally:
-            if path and os.path.exists(path):
-                os.unlink(path)
-    return refs
-
-
-def start_chat(client, file_refs):
-    """بيبدأ محادثة جديدة والملفات مرفقة في أول رسالة."""
-    file_parts = [
-        types.Part.from_uri(file_uri=ref.uri, mime_type=ref.mime_type or "application/pdf")
-        for ref in file_refs
-    ]
-    history = [
-        types.Content(
-            role="user",
-            parts=file_parts + [types.Part.from_text(
-                text="هذه هي المستندات الهندسية المرجعية. اعتمد عليها حصرياً في إجاباتك."
-            )],
-        ),
-        types.Content(
-            role="model",
-            parts=[types.Part.from_text(
-                text="لقد اطلعت على المستندات الهندسية المرفقة وأنا جاهز للإجابة على الاستفسارات الفنية."
-            )],
-        ),
-    ]
-    return client.chats.create(
-        model=MODEL_NAME,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-        history=history,
-    )
 
 
 def is_temporary_error(error):
@@ -152,8 +123,158 @@ def is_temporary_error(error):
     return any(k in msg for k in keywords) or "timeout" in kind
 
 
+def is_timeout_error(error):
+    msg = str(error).lower()
+    return "timed out" in msg or "timeout" in msg or "timeout" in type(error).__name__.lower()
+
+
+def file_sig(f):
+    """بصمة بسيطة للملف (الاسم + الحجم) عشان مانرفعوش مرتين."""
+    return (f.name, f.size)
+
+
+# ---------------------------------------------------------
+# رفع الملفات إلى جوجل
+# ---------------------------------------------------------
+def wait_for_file(client, uploaded):
+    """استنى لحد ما الملف المرفوع يبقى جاهز عند جوجل."""
+    while uploaded.state.name == "PROCESSING":
+        time.sleep(2)
+        uploaded = client.files.get(name=uploaded.name)
+    if uploaded.state.name == "FAILED":
+        raise RuntimeError("فشلت معالجة أحد الملفات عند جوجل. جرّب ملف PDF تاني.")
+    return uploaded
+
+
+def ensure_uploaded(client, files):
+    """بيرفع الملفات الجديدة بس، وبيحتفظ بمرجعها في الجلسة. بيرجع {بصمة الملف: مرجعه}."""
+    store = st.session_state.gem_files
+    for f in files:
+        sig = file_sig(f)
+        if sig in store:
+            continue
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(f.getvalue())
+                path = tmp.name
+            store[sig] = wait_for_file(client, client.files.upload(file=path))
+        finally:
+            if path and os.path.exists(path):
+                os.unlink(path)
+    return store
+
+
+def labeled_file_parts(label, name, ref):
+    """نص صغير بيعرّف الموديل الملف ده إيه، وبعده الملف نفسه."""
+    return [
+        types.Part.from_text(text=label + ": " + name),
+        types.Part.from_uri(file_uri=ref.uri, mime_type=ref.mime_type or "application/pdf"),
+    ]
+
+
+# ---------------------------------------------------------
+# مراجعة العروض الفنية
+# ---------------------------------------------------------
+def generate_with_fallback(client, contents):
+    """بيجرب الموديل الأساسي، ولو عليه ضغط أو تأخر بيجرب الموديلات الاحتياطية."""
+    last_error = None
+    for model in [MODEL_NAME] + FALLBACK_MODELS:
+        tries = 2 if model == MODEL_NAME else 1
+        for _ in range(tries):
+            try:
+                result = client.models.generate_content(model=model, contents=contents)
+                return (result.text or ""), model
+            except Exception as e:
+                if not is_temporary_error(e):
+                    raise
+                last_error = e
+                if is_timeout_error(e):
+                    break  # مانعيدش المحاولة على موديل اتأخر، ننتقل للي بعده
+                time.sleep(3)
+    raise last_error
+
+
+def review_submittal(client, spec_items, sub_name, sub_ref):
+    contents = []
+    for name, ref in spec_items:
+        contents += labeled_file_parts("مواصفات المشروع", name, ref)
+    contents += labeled_file_parts("العرض الفني للمورد", sub_name, sub_ref)
+    contents.append(types.Part.from_text(text=build_review_prompt([n for n, _ in spec_items], sub_name)))
+    return generate_with_fallback(client, contents)
+
+
+def run_reviews(client, pending, spec_items):
+    """بيفحص كل العروض اللي لسه ماتفحصتش واحد ورا التاني."""
+    progress = st.progress(0.0)
+    for i, sig in enumerate(pending):
+        item = st.session_state.submittals[sig]
+        progress.progress(
+            i / len(pending),
+            text="جاري فحص: " + item["name"] + " (" + str(i + 1) + " من " + str(len(pending)) + ")",
+        )
+        try:
+            text, model = review_submittal(client, spec_items, item["name"], item["ref"])
+            st.session_state.reports[sig] = {
+                "text": text or "لم أتمكن من توليد التقرير، جرّب إعادة الفحص.",
+                "model": model,
+            }
+        except Exception as e:
+            if is_temporary_error(e):
+                st.error("تعذر فحص " + item["name"] + ": خوادم جوجل عليها ضغط. جرّب تاني بعد دقيقة.")
+            else:
+                st.error("تعذر فحص " + item["name"] + ": " + str(e))
+    progress.progress(1.0)
+
+
+# ---------------------------------------------------------
+# الشات الهندسي
+# ---------------------------------------------------------
+def prior_history(messages):
+    """بيحوّل المحادثة السابقة لسجل جاهز للموديل (من غير سؤال معلّق من غير إجابة)."""
+    msgs = list(messages)
+    while msgs and msgs[-1]["role"] == "user":
+        msgs.pop()
+    history = []
+    for m in msgs:
+        role = "user" if m["role"] == "user" else "model"
+        history.append(types.Content(role=role, parts=[types.Part.from_text(text=m["text"])]))
+    return history
+
+
+def start_chat(client, spec_items, sub_items, reports, messages):
+    """بيبدأ محادثة جديدة والمستندات (المواصفات + العروض + التقارير) مرفقة في أول رسالة."""
+    parts = []
+    for name, ref in spec_items:
+        parts += labeled_file_parts("مواصفات المشروع", name, ref)
+    for name, ref in sub_items:
+        parts += labeled_file_parts("عرض فني من مورد", name, ref)
+
+    intro = "هذه هي المستندات المرجعية. اعتمد عليها حصرياً في إجاباتك."
+    if reports:
+        intro += "\n\nتقارير المراجعة التي تمت بالفعل على العروض الفنية:\n"
+        intro += "\n\n".join("### " + name + "\n" + text for name, text in reports)
+    parts.append(types.Part.from_text(text=intro))
+
+    history = [
+        types.Content(role="user", parts=parts),
+        types.Content(
+            role="model",
+            parts=[types.Part.from_text(
+                text="لقد اطلعت على المستندات المرفقة وأنا جاهز للإجابة على الاستفسارات الفنية."
+            )],
+        ),
+    ] + prior_history(messages)
+
+    return client.chats.create(
+        model=MODEL_NAME,
+        config=types.GenerateContentConfig(system_instruction=CHAT_SYSTEM_PROMPT),
+        history=history,
+    )
+
+
 def send_with_retry(client, query):
-    """بيعيد المحاولة كذا مرة لو الموديل عليه ضغط، وبعدها بيجرب موديل احتياطي."""
+    """بيعيد المحاولة كذا مرة لو الموديل عليه ضغط، وبعدها بيجرب موديلات احتياطية."""
     st.session_state.fallback_used = None
     for attempt in range(3):
         try:
@@ -164,7 +285,7 @@ def send_with_retry(client, query):
             time.sleep(2 ** (attempt + 1))  # 2 ثم 4 ثم 8 ثواني
 
     # كل المحاولات فشلت: جرّب الموديلات الاحتياطية بنفس سجل المحادثة
-    config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+    config = types.GenerateContentConfig(system_instruction=CHAT_SYSTEM_PROMPT)
     history = st.session_state.chat.get_history()
     last_error = None
     for model in FALLBACK_MODELS:
@@ -213,10 +334,20 @@ def transcribe_audio(client, audio_bytes, mime_type="audio/wav"):
     raise last_error
 
 
+# ---------------------------------------------------------
+# تصدير ملف Word (تقارير العروض + المحادثة كاملة)
+# ---------------------------------------------------------
 def _rtl_paragraph(paragraph):
     """الفقرة من اليمين لليسار."""
     paragraph._p.get_or_add_pPr().append(OxmlElement("w:bidi"))
     return paragraph
+
+
+def _rtl_heading(doc, text, level):
+    heading = _rtl_paragraph(doc.add_heading(text, level))
+    for run in heading.runs:
+        run.font.rtl = True
+    return heading
 
 
 def _add_formatted_text(paragraph, text):
@@ -280,10 +411,7 @@ def _add_markdown(doc, text):
                 _add_table(doc, rows)
             continue
         if line.startswith("#"):
-            para = doc.add_heading(line.lstrip("#").strip().replace("**", ""), level=3)
-            _rtl_paragraph(para)
-            for run in para.runs:
-                run.font.rtl = True
+            _rtl_heading(doc, line.lstrip("#").strip().replace("**", ""), 4)
         elif line.startswith(("- ", "* ", "• ")):
             para = _rtl_paragraph(doc.add_paragraph(style="List Bullet"))
             _add_formatted_text(para, line[2:].strip())
@@ -293,33 +421,38 @@ def _add_markdown(doc, text):
         i += 1
 
 
-def build_word_file(messages, file_names=None):
-    """بيعمل ملف Word فيه المحادثة كلها (كل الأسئلة وكل الإجابات) بالترتيب."""
+def build_word_file(messages, spec_names, submittal_names, reports):
+    """ملف Word واحد فيه تقارير مراجعة العروض ثم المحادثة كلها بالترتيب."""
     doc = Document()
-    title = _rtl_paragraph(doc.add_heading("سجل المحادثة الاستشارية - مواصفات الكهرباء", 0))
-    for run in title.runs:
-        run.font.rtl = True
+    _rtl_heading(doc, "تقرير منصة مراجعة العروض الفنية ومواصفات الكهرباء", 0)
 
     info = _rtl_paragraph(doc.add_paragraph())
     _add_formatted_text(info, "تاريخ التصدير: " + date.today().isoformat())
-    if file_names:
-        docs_line = _rtl_paragraph(doc.add_paragraph())
-        _add_formatted_text(docs_line, "المستندات المرجعية: " + "، ".join(file_names))
+    if spec_names:
+        para = _rtl_paragraph(doc.add_paragraph())
+        _add_formatted_text(para, "مواصفات المشروع: " + "، ".join(spec_names))
+    if submittal_names:
+        para = _rtl_paragraph(doc.add_paragraph())
+        _add_formatted_text(para, "العروض الفنية المرفوعة: " + "، ".join(submittal_names))
 
-    q_no = 0
-    for msg in messages:
-        if msg["role"] == "user":
-            q_no += 1
-            heading = _rtl_paragraph(doc.add_heading("السؤال " + str(q_no), level=1))
-            for run in heading.runs:
-                run.font.rtl = True
-            para = _rtl_paragraph(doc.add_paragraph())
-            _add_formatted_text(para, msg["text"])
-        else:
-            heading = _rtl_paragraph(doc.add_heading("الإجابة", level=2))
-            for run in heading.runs:
-                run.font.rtl = True
-            _add_markdown(doc, msg["text"])
+    if reports:
+        _rtl_heading(doc, "أولاً: تقارير مراجعة العروض الفنية", 1)
+        for name, text in reports:
+            _rtl_heading(doc, "تقرير مراجعة: " + name, 2)
+            _add_markdown(doc, text)
+
+    if messages:
+        _rtl_heading(doc, "ثانياً: سجل المحادثة الاستشارية", 1)
+        q_no = 0
+        for msg in messages:
+            if msg["role"] == "user":
+                q_no += 1
+                _rtl_heading(doc, "السؤال " + str(q_no), 2)
+                para = _rtl_paragraph(doc.add_paragraph())
+                _add_formatted_text(para, msg["text"])
+            else:
+                _rtl_heading(doc, "الإجابة", 3)
+                _add_markdown(doc, msg["text"])
 
     buffer = BytesIO()
     doc.save(buffer)
@@ -328,36 +461,149 @@ def build_word_file(messages, file_names=None):
 
 
 # ---------------------------------------------------------
-# الواجهة
+# الحالة (session state)
 # ---------------------------------------------------------
-st.sidebar.title("⚙️ إعدادات النظام الهندسي")
-api_key = st.sidebar.text_input("أدخل مفتاح Google AI Studio API", type="password")
+def reset_workspace():
+    """بيمسح كل حاجة مرتبطة بالمفتاح أو المواصفات القديمة."""
+    st.session_state.gem_files = {}
+    st.session_state.submittals = {}   # {بصمة الملف: {"name":..., "ref":...}}
+    st.session_state.reports = {}      # {بصمة الملف: {"text":..., "model":...}}
+    st.session_state.messages = []
+    st.session_state.chat = None
+    st.session_state.chat_sig = None
+    st.session_state.spec_sig = None
 
-st.title("⚡ مساعد مواصفات وعقود الكهرباء (MEP AI Consultant)")
 
-uploaded_files = st.sidebar.file_uploader(
-    "ارفع ملفات المواصفات أو الأكواد (PDF)", type=["pdf"], accept_multiple_files=True
+if "gem_files" not in st.session_state:
+    reset_workspace()
+    st.session_state.key_used = None
+    st.session_state.sub_up_n = 0
+    st.session_state.audio_n = 0
+
+# ---------------------------------------------------------
+# الواجهة: القائمة الجانبية
+# ---------------------------------------------------------
+st.sidebar.title("⚙️ إعدادات المنصة")
+api_key = st.sidebar.text_input("أدخل مفتاح Google AI Studio API", type="password").strip()
+
+spec_files = st.sidebar.file_uploader(
+    "1️⃣ ارفع مواصفات المشروع (PDF)",
+    type=["pdf"],
+    accept_multiple_files=True,
+    key="spec_uploader",
 )
 
-if "messages" not in st.session_state:
+page = st.sidebar.radio("القسم", [PAGE_REVIEW, PAGE_CHAT], key="page")
+
+st.title("⚡ منصة مراجعة العروض الفنية ومواصفات الكهرباء (MEP AI Platform)")
+
+if not api_key or not spec_files:
+    st.info("الرجاء إدخال مفتاح الـ API ورفع مواصفات المشروع من القائمة الجانبية لبدء العمل.")
+    st.stop()
+
+client = get_client(api_key)
+
+# لو المفتاح اتغير، الملفات المرفوعة بالمفتاح القديم مبقتش صالحة
+if st.session_state.key_used != api_key:
+    reset_workspace()
+    st.session_state.key_used = api_key
+
+# رفع المواصفات (مرة واحدة بس). لو اتغيّرت نبدأ من الأول
+spec_sig = tuple(sorted(file_sig(f) for f in spec_files))
+if st.session_state.spec_sig != spec_sig:
+    try:
+        with st.spinner("جاري رفع وقراءة مواصفات المشروع..."):
+            ensure_uploaded(client, spec_files)
+    except Exception as e:
+        st.error("حدث خطأ أثناء رفع المواصفات: " + str(e))
+        st.stop()
+    st.session_state.reports = {}
     st.session_state.messages = []
+    st.session_state.chat = None
+    st.session_state.spec_sig = spec_sig
 
-if uploaded_files and api_key:
-    api_key = api_key.strip()
-    client = get_client(api_key)
+spec_items = [(f.name, st.session_state.gem_files[file_sig(f)]) for f in spec_files]
+spec_names = [name for name, _ in spec_items]
+subs = st.session_state.submittals
+reports = st.session_state.reports
 
-    # لو الملفات أو المفتاح اتغيروا، نرفع الملفات ونبدأ محادثة جديدة
-    signature = (tuple((f.name, f.size) for f in uploaded_files), api_key)
-    if st.session_state.get("signature") != signature:
+# ---------------------------------------------------------
+# صفحة مراجعة العروض الفنية
+# ---------------------------------------------------------
+if page == PAGE_REVIEW:
+    st.header(PAGE_REVIEW)
+    st.caption("ارفع عرضاً فنياً أو أكثر. كل عرض بيتقارن مع مواصفات المشروع اللي رفعتها في القائمة الجانبية.")
+
+    new_files = st.file_uploader(
+        "2️⃣ ارفع العروض الفنية للموردين (PDF)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="sub_uploader_" + str(st.session_state.sub_up_n),
+    )
+    if new_files:
         try:
-            with st.spinner("جاري قراءة وتحليل المستندات الهندسية..."):
-                refs = upload_files_to_gemini(client, uploaded_files)
-                st.session_state.chat = start_chat(client, refs)
-            st.session_state.signature = signature
-            st.session_state.messages = []
+            with st.spinner("جاري رفع العروض..."):
+                ensure_uploaded(client, new_files)
+            for f in new_files:
+                sig = file_sig(f)
+                subs[sig] = {"name": f.name, "ref": st.session_state.gem_files[sig]}
+            st.session_state.sub_up_n += 1  # بيفضّي خانة الرفع
+            st.rerun()
         except Exception as e:
-            st.session_state.pop("signature", None)
-            st.error(f"حدث خطأ أثناء رفع المستندات: {e}")
+            st.error("حدث خطأ أثناء رفع العروض: " + str(e))
+
+    if not subs:
+        st.info("لسه مفيش عروض مرفوعة.")
+    else:
+        pending = [sig for sig in subs if sig not in reports]
+        if pending:
+            if st.button("🚀 فحص العروض الجديدة (" + str(len(pending)) + ")", type="primary"):
+                run_reviews(client, pending, spec_items)
+
+        st.markdown("### العروض المرفوعة")
+        for idx, (sig, item) in enumerate(list(subs.items())):
+            col_name, col_status, col_del = st.columns([6, 3, 1])
+            col_name.markdown("📄 " + item["name"])
+            col_status.markdown("✅ تم الفحص" if sig in reports else "⏳ لم يُفحص بعد")
+            if col_del.button("🗑️", key="del_" + str(idx), help="حذف هذا العرض"):
+                subs.pop(sig, None)
+                reports.pop(sig, None)
+                st.rerun()
+
+        if reports:
+            st.markdown("### 📋 تقارير المراجعة")
+            for sig, item in subs.items():
+                if sig not in reports:
+                    continue
+                with st.expander("📋 " + item["name"], expanded=(len(reports) == 1)):
+                    st.markdown(clean_text(reports[sig]["text"]))
+                    if reports[sig]["model"] != MODEL_NAME:
+                        st.caption("ℹ️ الموديل الأساسي كان عليه ضغط، فالتقرير ده من موديل أخف. راجع الأرقام المهمة بنفسك.")
+
+# ---------------------------------------------------------
+# صفحة الشات الهندسي
+# ---------------------------------------------------------
+else:
+    st.header(PAGE_CHAT)
+    st.caption(
+        "الشات بيعرف المواصفات (" + str(len(spec_items)) + " ملف) "
+        "والعروض الفنية المرفوعة (" + str(len(subs)) + " ملف) وتقارير المراجعة."
+    )
+
+    sub_items = [(item["name"], item["ref"]) for item in subs.values()]
+    report_items = [(subs[sig]["name"], reports[sig]["text"]) for sig in subs if sig in reports]
+
+    # لو المستندات أو التقارير اتغيرت، نبدأ محادثة جديدة بنفس السجل السابق
+    chat_sig = (spec_sig, tuple(sorted(subs.keys())), tuple(sorted(reports.keys())))
+    if st.session_state.chat is None or st.session_state.chat_sig != chat_sig:
+        try:
+            with st.spinner("جاري تجهيز الشات..."):
+                st.session_state.chat = start_chat(
+                    client, spec_items, sub_items, report_items, st.session_state.messages
+                )
+            st.session_state.chat_sig = chat_sig
+        except Exception as e:
+            st.error("حدث خطأ أثناء تجهيز الشات: " + str(e))
             st.stop()
 
     # عرض المحادثة السابقة
@@ -368,11 +614,9 @@ if uploaded_files and api_key:
     # الإدخال الصوتي (ميكروفون)
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎤 اسأل بالصوت")
-    if "audio_n" not in st.session_state:
-        st.session_state.audio_n = 0
     audio = st.sidebar.audio_input(
         "اضغط على الميكروفون، اتكلم، وبعدين اضغط إيقاف",
-        key=f"audio_{st.session_state.audio_n}",
+        key="audio_" + str(st.session_state.audio_n),
     )
     if audio is not None:
         st.sidebar.caption(
@@ -406,7 +650,7 @@ if uploaded_files and api_key:
                 if is_temporary_error(e):
                     st.sidebar.error("خوادم جوجل عليها ضغط دلوقتي. استنى دقيقة وجرّب تاني.")
                 else:
-                    st.sidebar.error(f"حدث خطأ أثناء تحويل الصوت: {e}")
+                    st.sidebar.error("حدث خطأ أثناء تحويل الصوت: " + str(e))
 
     # مراجعة النص المفرّغ قبل الإرسال (عشان تصحح أي كلمة اتفهمت غلط)
     voice_query = None
@@ -426,7 +670,7 @@ if uploaded_files and api_key:
             st.rerun()
 
     # واجهة المحادثة
-    text_query = st.chat_input("اكتب استفسارك الفني أو اطلب جدول مقارنة للمواصفات...")
+    text_query = st.chat_input("اكتب استفسارك الفني أو اطلب جدول مقارنة بين العرض والمواصفات...")
     user_query = text_query or voice_query
     if user_query:
         st.session_state.messages.append({"role": "user", "text": user_query})
@@ -450,21 +694,29 @@ if uploaded_files and api_key:
                 if is_temporary_error(e):
                     st.error("خوادم جوجل عليها ضغط عالي دلوقتي. استنى دقيقة واسأل السؤال تاني.")
                 else:
-                    st.error(f"حدث خطأ أثناء المعالجة: {e}")
+                    st.error("حدث خطأ أثناء المعالجة: " + str(e))
 
-    # زر تصدير المحادثة كاملة إلى Word
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📄 تصدير المخرجات")
-    if st.session_state.messages:
-        questions_count = sum(1 for m in st.session_state.messages if m["role"] == "user")
-        st.sidebar.caption("عدد الأسئلة في المحادثة: " + str(questions_count))
-        st.sidebar.download_button(
-            label="📥 تحميل المحادثة كاملة (Word)",
-            data=build_word_file(st.session_state.messages, [f.name for f in uploaded_files]),
-            file_name="MEP_Chat_History.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-    else:
-        st.sidebar.caption("اسأل سؤالاً أولاً، وبعدها هيظهر زر التحميل.")
+# ---------------------------------------------------------
+# تصدير كل حاجة إلى Word (تقارير العروض + المحادثة كاملة)
+# ---------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("📄 تصدير المخرجات")
+export_reports = [(subs[sig]["name"], reports[sig]["text"]) for sig in subs if sig in reports]
+if export_reports or st.session_state.messages:
+    st.sidebar.caption(
+        "تقارير العروض: " + str(len(export_reports))
+        + " | أسئلة الشات: " + str(sum(1 for m in st.session_state.messages if m["role"] == "user"))
+    )
+    st.sidebar.download_button(
+        label="📥 تحميل التقرير الكامل (Word)",
+        data=build_word_file(
+            st.session_state.messages,
+            spec_names,
+            [item["name"] for item in subs.values()],
+            export_reports,
+        ),
+        file_name="MEP_Platform_Report.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 else:
-    st.info("الرجاء إدخال مفتاح الـ API ورفع مستندات الـ PDF من القائمة الجانبية لبدء الاستشارات الفنية.")
+    st.sidebar.caption("افحص عرضاً أو اسأل سؤالاً أولاً، وبعدها هيظهر زر التحميل.")
